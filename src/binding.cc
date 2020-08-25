@@ -115,6 +115,11 @@ void v8__Isolate__Enter(v8::Isolate* isolate) { isolate->Enter(); }
 
 void v8__Isolate__Exit(v8::Isolate* isolate) { isolate->Exit(); }
 
+void v8__Isolate__GetHeapStatistics(v8::Isolate* isolate,
+                                    v8::HeapStatistics* s) {
+  isolate->GetHeapStatistics(s);
+}
+
 const v8::Context* v8__Isolate__GetCurrentContext(v8::Isolate* isolate) {
   return local_to_ptr(isolate->GetCurrentContext());
 }
@@ -136,8 +141,24 @@ uint32_t v8__Isolate__GetNumberOfDataSlots(v8::Isolate* isolate) {
   return SLOT_NUM_EXTERNAL(isolate);
 }
 
-void v8__Isolate__RunMicrotasks(v8::Isolate* isolate) {
-  isolate->RunMicrotasks();
+v8::MicrotasksPolicy v8__Isolate__GetMicrotasksPolicy(
+    const v8::Isolate* isolate) {
+  return isolate->GetMicrotasksPolicy();
+}
+
+void v8__Isolate__SetMicrotasksPolicy(v8::Isolate* isolate,
+                                      v8::MicrotasksPolicy policy) {
+  static_assert(0 == static_cast<uint32_t>(v8::MicrotasksPolicy::kExplicit),
+                "v8::MicrotasksPolicy::kExplicit mismatch");
+  static_assert(1 == static_cast<uint32_t>(v8::MicrotasksPolicy::kScoped),
+                "v8::MicrotasksPolicy::kScoped mismatch");
+  static_assert(2 == static_cast<uint32_t>(v8::MicrotasksPolicy::kAuto),
+                "v8::MicrotasksPolicy::kAuto mismatch");
+  isolate->SetMicrotasksPolicy(policy);
+}
+
+void v8__Isolate__PerformMicrotaskCheckpoint(v8::Isolate* isolate) {
+  isolate->PerformMicrotaskCheckpoint();
 }
 
 void v8__Isolate__EnqueueMicrotask(v8::Isolate* isolate,
@@ -178,6 +199,18 @@ bool v8__Isolate__AddMessageListener(v8::Isolate* isolate,
   return isolate->AddMessageListener(callback);
 }
 
+void v8__Isolate__AddNearHeapLimitCallback(v8::Isolate* isolate,
+                                           v8::NearHeapLimitCallback callback,
+                                           void* data) {
+  isolate->AddNearHeapLimitCallback(callback, data);
+}
+
+void v8__Isolate__RemoveNearHeapLimitCallback(
+    v8::Isolate* isolate, v8::NearHeapLimitCallback callback,
+    size_t heap_limit) {
+  isolate->RemoveNearHeapLimitCallback(callback, heap_limit);
+}
+
 const v8::Value* v8__Isolate__ThrowException(v8::Isolate* isolate,
                                              const v8::Value& exception) {
   return local_to_ptr(isolate->ThrowException(ptr_to_local(&exception)));
@@ -202,6 +235,13 @@ void v8__Isolate__CreateParams__CONSTRUCT(
 
 size_t v8__Isolate__CreateParams__SIZEOF() {
   return sizeof(v8::Isolate::CreateParams);
+}
+
+void v8__ResourceConstraints__ConfigureDefaultsFromHeapSize(
+    v8::ResourceConstraints* constraints, size_t initial_heap_size_in_bytes,
+    size_t maximum_heap_size_in_bytes) {
+  constraints->ConfigureDefaultsFromHeapSize(initial_heap_size_in_bytes,
+                                             maximum_heap_size_in_bytes);
 }
 
 void v8__HandleScope__CONSTRUCT(uninit_t<v8::HandleScope>* buf,
@@ -743,11 +783,10 @@ MaybeBool v8__Object__SetAccessor(const v8::Object& self,
       ptr_to_local(&context), ptr_to_local(&key), getter));
 }
 
-MaybeBool v8__Object__SetAccessorWithSetter(const v8::Object& self,
-                                            const v8::Context& context,
-                                            const v8::Name& key,
-                                            v8::AccessorNameGetterCallback getter,
-                                            v8::AccessorNameSetterCallback setter) {
+MaybeBool v8__Object__SetAccessorWithSetter(
+    const v8::Object& self, const v8::Context& context, const v8::Name& key,
+    v8::AccessorNameGetterCallback getter,
+    v8::AccessorNameSetterCallback setter) {
   return maybe_to_maybe_bool(ptr_to_local(&self)->SetAccessor(
       ptr_to_local(&context), ptr_to_local(&key), getter, setter));
 }
@@ -1412,8 +1451,11 @@ void v8__SnapshotCreator__DESTRUCT(v8::SnapshotCreator* self) {
 
 void v8__StartupData__DESTRUCT(v8::StartupData* self) { delete[] self->data; }
 
-v8::Isolate* v8__SnapshotCreator__GetIsolate(v8::SnapshotCreator* self) {
-  return self->GetIsolate();
+v8::Isolate* v8__SnapshotCreator__GetIsolate(const v8::SnapshotCreator& self) {
+  // `v8::SnapshotCreator::GetIsolate()` is not declared as a const method, but
+  // this appears to be a mistake.
+  auto self_ptr = const_cast<v8::SnapshotCreator*>(&self);
+  return self_ptr->GetIsolate();
 }
 
 v8::StartupData SerializeInternalFields(v8::Local<v8::Object> holder, int index,
@@ -1756,5 +1798,36 @@ int v8__internal__Object__GetHash(const v8::Data& data) {
   assert(hash != 0);
   return hash;
 }
+
+void v8__HeapStatistics__CONSTRUCT(uninit_t<v8::HeapStatistics>* buf) {
+  // Should be <= than its counterpart in src/isolate.rs
+  static_assert(sizeof(v8::HeapStatistics) <= sizeof(uintptr_t[16]),
+                "HeapStatistics mismatch");
+  construct_in_place<v8::HeapStatistics>(buf);
+}
+
+// The const_cast doesn't violate const correctness, the methods
+// are simple getters that don't mutate the object or global state.
+#define V(name)                                                               \
+  size_t v8__HeapStatistics__##name(const v8::HeapStatistics* s) {            \
+    return const_cast<v8::HeapStatistics*>(s)->name();                        \
+  }
+
+V(total_heap_size)
+V(total_heap_size_executable)
+V(total_physical_size)
+V(total_available_size)
+V(total_global_handles_size)
+V(used_global_handles_size)
+V(used_heap_size)
+V(heap_size_limit)
+V(malloced_memory)
+V(external_memory)
+V(peak_malloced_memory)
+V(number_of_native_contexts)
+V(number_of_detached_contexts)
+V(does_zap_garbage)  // Returns size_t, not bool like you'd expect.
+
+#undef V
 
 }  // extern "C"

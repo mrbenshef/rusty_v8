@@ -4,6 +4,7 @@
 extern crate lazy_static;
 
 use std::convert::{Into, TryFrom, TryInto};
+use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -294,7 +295,14 @@ fn microtasks() {
   let _setup_guard = setup();
   let isolate = &mut v8::Isolate::new(Default::default());
 
-  isolate.run_microtasks();
+  assert_eq!(isolate.get_microtasks_policy(), v8::MicrotasksPolicy::Auto);
+  isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+  assert_eq!(
+    isolate.get_microtasks_policy(),
+    v8::MicrotasksPolicy::Explicit
+  );
+
+  isolate.perform_microtask_checkpoint();
 
   {
     let scope = &mut v8::HandleScope::new(isolate);
@@ -313,9 +321,20 @@ fn microtasks() {
     .unwrap();
     scope.enqueue_microtask(function);
 
+    // Flushes the microtasks queue unless the policy is set to explicit.
+    let _ = eval(scope, "").unwrap();
+
     assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 0);
-    scope.run_microtasks();
+    scope.perform_microtask_checkpoint();
     assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 1);
+
+    scope.set_microtasks_policy(v8::MicrotasksPolicy::Auto);
+    assert_eq!(scope.get_microtasks_policy(), v8::MicrotasksPolicy::Auto);
+    scope.enqueue_microtask(function);
+
+    let _ = eval(scope, "").unwrap();
+
+    assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 2);
   }
 }
 
@@ -3312,4 +3331,81 @@ fn module_snapshot() {
       assert!(result.same_value(true_val));
     }
   }
+}
+
+#[derive(Default)]
+struct TestHeapLimitState {
+  near_heap_limit_callback_calls: u64,
+}
+
+extern "C" fn heap_limit_callback(
+  data: *mut c_void,
+  current_heap_limit: usize,
+  _initial_heap_limit: usize,
+) -> usize {
+  let state = unsafe { &mut *(data as *mut TestHeapLimitState) };
+  state.near_heap_limit_callback_calls += 1;
+  current_heap_limit * 2 // Avoid V8 OOM.
+}
+
+#[test]
+fn heap_limits() {
+  let _setup_guard = setup();
+
+  let params = v8::CreateParams::default().heap_limits(0, 10 << 20); // 10 MB.
+  let isolate = &mut v8::Isolate::new(params);
+
+  let mut test_state = TestHeapLimitState::default();
+  let state_ptr = &mut test_state as *mut _ as *mut c_void;
+  isolate.add_near_heap_limit_callback(heap_limit_callback, state_ptr);
+
+  let scope = &mut v8::HandleScope::new(isolate);
+  let context = v8::Context::new(scope);
+  let scope = &mut v8::ContextScope::new(scope, context);
+
+  // Allocate JavaScript arrays until V8 calls the near-heap-limit callback.
+  // It takes about 100-200k iterations of this loop to get to that point.
+  for _ in 0..1_000_000 {
+    eval(
+      scope,
+      r#"
+        "hello 🦕 world"
+          .repeat(5)
+          .split("🦕", 2)
+          .map((s) => s.split(""))
+          .shift()
+      "#,
+    )
+    .unwrap();
+    if test_state.near_heap_limit_callback_calls > 0 {
+      break;
+    }
+  }
+  assert_eq!(1, test_state.near_heap_limit_callback_calls);
+}
+
+#[test]
+fn heap_statistics() {
+  let _setup_guard = setup();
+
+  let params = v8::CreateParams::default().heap_limits(0, 10 << 20); // 10 MB.
+  let isolate = &mut v8::Isolate::new(params);
+
+  let mut s = v8::HeapStatistics::default();
+  isolate.get_heap_statistics(&mut s);
+  assert!(s.heap_size_limit() > 0);
+  assert!(s.total_heap_size() > 0);
+  assert!(s.total_global_handles_size() >= s.used_global_handles_size());
+  assert!(s.used_heap_size() > 0);
+  assert!(s.heap_size_limit() >= s.used_heap_size());
+  assert!(s.peak_malloced_memory() >= s.malloced_memory());
+  assert_eq!(s.number_of_native_contexts(), 0);
+
+  let scope = &mut v8::HandleScope::new(isolate);
+  let context = v8::Context::new(scope);
+  let scope = &mut v8::ContextScope::new(scope, context);
+  let _ = eval(scope, "").unwrap();
+
+  scope.get_heap_statistics(&mut s);
+  assert_ne!(s.number_of_native_contexts(), 0);
 }

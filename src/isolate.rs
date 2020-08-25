@@ -20,12 +20,26 @@ use std::any::TypeId;
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::ptr::null_mut;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::Mutex;
+
+/// Policy for running microtasks:
+///   - explicit: microtasks are invoked with the
+///               Isolate::PerformMicrotaskCheckpoint() method;
+///   - auto: microtasks are invoked when the script call depth decrements
+///           to zero.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+pub enum MicrotasksPolicy {
+  Explicit = 0,
+  // Scoped = 1 (RAII) is omitted for now, doesn't quite map to idiomatic Rust.
+  Auto = 2,
+}
 
 pub type MessageCallback = extern "C" fn(Local<Message>, Local<Value>);
 
@@ -69,6 +83,20 @@ pub type HostImportModuleDynamicallyCallback = extern "C" fn(
 pub type InterruptCallback =
   extern "C" fn(isolate: &mut Isolate, data: *mut c_void);
 
+pub type NearHeapLimitCallback = extern "C" fn(
+  data: *mut c_void,
+  current_heap_limit: usize,
+  initial_heap_limit: usize,
+) -> usize;
+
+/// Collection of V8 heap information.
+///
+/// Instances of this class can be passed to v8::Isolate::GetHeapStatistics to
+/// get heap statistics from V8.
+// Must be >= sizeof(v8::HeapStatistics), see v8__HeapStatistics__CONSTRUCT().
+#[repr(C)]
+pub struct HeapStatistics([usize; 16]);
+
 extern "C" {
   fn v8__Isolate__New(params: *const raw::CreateParams) -> *mut Isolate;
   fn v8__Isolate__Dispose(this: *mut Isolate);
@@ -77,6 +105,7 @@ extern "C" {
   fn v8__Isolate__GetNumberOfDataSlots(this: *const Isolate) -> u32;
   fn v8__Isolate__Enter(this: *mut Isolate);
   fn v8__Isolate__Exit(this: *mut Isolate);
+  fn v8__Isolate__GetHeapStatistics(this: *mut Isolate, s: *mut HeapStatistics);
   fn v8__Isolate__SetCaptureStackTraceForUncaughtExceptions(
     this: *mut Isolate,
     caputre: bool,
@@ -86,6 +115,16 @@ extern "C" {
     isolate: *mut Isolate,
     callback: MessageCallback,
   ) -> bool;
+  fn v8__Isolate__AddNearHeapLimitCallback(
+    isolate: *mut Isolate,
+    callback: NearHeapLimitCallback,
+    data: *mut c_void,
+  );
+  fn v8__Isolate__RemoveNearHeapLimitCallback(
+    isolate: *mut Isolate,
+    callback: NearHeapLimitCallback,
+    heap_limit: usize,
+  );
   fn v8__Isolate__SetPromiseRejectCallback(
     isolate: *mut Isolate,
     callback: PromiseRejectCallback,
@@ -106,7 +145,14 @@ extern "C" {
   fn v8__Isolate__TerminateExecution(isolate: *const Isolate);
   fn v8__Isolate__IsExecutionTerminating(isolate: *const Isolate) -> bool;
   fn v8__Isolate__CancelTerminateExecution(isolate: *const Isolate);
-  fn v8__Isolate__RunMicrotasks(isolate: *mut Isolate);
+  fn v8__Isolate__GetMicrotasksPolicy(
+    isolate: *const Isolate,
+  ) -> MicrotasksPolicy;
+  fn v8__Isolate__SetMicrotasksPolicy(
+    isolate: *mut Isolate,
+    policy: MicrotasksPolicy,
+  );
+  fn v8__Isolate__PerformMicrotaskCheckpoint(isolate: *mut Isolate);
   fn v8__Isolate__EnqueueMicrotask(
     isolate: *mut Isolate,
     function: *const Function,
@@ -117,6 +163,37 @@ extern "C" {
     callback: extern "C" fn(*mut c_void, *const u8, usize) -> bool,
     arg: *mut c_void,
   );
+
+  fn v8__HeapStatistics__CONSTRUCT(s: *mut MaybeUninit<HeapStatistics>);
+  fn v8__HeapStatistics__total_heap_size(s: *const HeapStatistics) -> usize;
+  fn v8__HeapStatistics__total_heap_size_executable(
+    s: *const HeapStatistics,
+  ) -> usize;
+  fn v8__HeapStatistics__total_physical_size(s: *const HeapStatistics)
+    -> usize;
+  fn v8__HeapStatistics__total_available_size(
+    s: *const HeapStatistics,
+  ) -> usize;
+  fn v8__HeapStatistics__total_global_handles_size(
+    s: *const HeapStatistics,
+  ) -> usize;
+  fn v8__HeapStatistics__used_global_handles_size(
+    s: *const HeapStatistics,
+  ) -> usize;
+  fn v8__HeapStatistics__used_heap_size(s: *const HeapStatistics) -> usize;
+  fn v8__HeapStatistics__heap_size_limit(s: *const HeapStatistics) -> usize;
+  fn v8__HeapStatistics__malloced_memory(s: *const HeapStatistics) -> usize;
+  fn v8__HeapStatistics__external_memory(s: *const HeapStatistics) -> usize;
+  fn v8__HeapStatistics__peak_malloced_memory(
+    s: *const HeapStatistics,
+  ) -> usize;
+  fn v8__HeapStatistics__number_of_native_contexts(
+    s: *const HeapStatistics,
+  ) -> usize;
+  fn v8__HeapStatistics__number_of_detached_contexts(
+    s: *const HeapStatistics,
+  ) -> usize;
+  fn v8__HeapStatistics__does_zap_garbage(s: *const HeapStatistics) -> usize;
 }
 
 #[repr(C)]
@@ -289,6 +366,11 @@ impl Isolate {
     unsafe { v8__Isolate__Exit(self) }
   }
 
+  /// Get statistics about the heap memory usage.
+  pub fn get_heap_statistics(&mut self, s: &mut HeapStatistics) {
+    unsafe { v8__Isolate__GetHeapStatistics(self, s) }
+  }
+
   /// Tells V8 to capture current stack trace when uncaught exception occurs
   /// and report it to the message listeners. The option is off by default.
   pub fn set_capture_stack_trace_for_uncaught_exceptions(
@@ -345,10 +427,54 @@ impl Isolate {
     }
   }
 
-  /// Runs the default MicrotaskQueue until it gets empty.
-  /// Any exceptions thrown by microtask callbacks are swallowed.
+  /// Add a callback to invoke in case the heap size is close to the heap limit.
+  /// If multiple callbacks are added, only the most recently added callback is
+  /// invoked.
+  #[allow(clippy::not_unsafe_ptr_arg_deref)] // False positive.
+  pub fn add_near_heap_limit_callback(
+    &mut self,
+    callback: NearHeapLimitCallback,
+    data: *mut c_void,
+  ) {
+    unsafe { v8__Isolate__AddNearHeapLimitCallback(self, callback, data) };
+  }
+
+  /// Remove the given callback and restore the heap limit to the given limit.
+  /// If the given limit is zero, then it is ignored. If the current heap size
+  /// is greater than the given limit, then the heap limit is restored to the
+  /// minimal limit that is possible for the current heap size.
+  pub fn remove_near_heap_limit_callback(
+    &mut self,
+    callback: NearHeapLimitCallback,
+    heap_limit: usize,
+  ) {
+    unsafe {
+      v8__Isolate__RemoveNearHeapLimitCallback(self, callback, heap_limit)
+    };
+  }
+
+  /// Returns the policy controlling how Microtasks are invoked.
+  pub fn get_microtasks_policy(&self) -> MicrotasksPolicy {
+    unsafe { v8__Isolate__GetMicrotasksPolicy(self) }
+  }
+
+  /// Returns the policy controlling how Microtasks are invoked.
+  pub fn set_microtasks_policy(&mut self, policy: MicrotasksPolicy) {
+    unsafe { v8__Isolate__SetMicrotasksPolicy(self, policy) }
+  }
+
+  /// Runs the default MicrotaskQueue until it gets empty and perform other
+  /// microtask checkpoint steps, such as calling ClearKeptObjects. Asserts that
+  /// the MicrotasksPolicy is not kScoped. Any exceptions thrown by microtask
+  /// callbacks are swallowed.
+  pub fn perform_microtask_checkpoint(&mut self) {
+    unsafe { v8__Isolate__PerformMicrotaskCheckpoint(self) }
+  }
+
+  /// An alias for PerformMicrotaskCheckpoint.
+  #[deprecated(note = "Use Isolate::perform_microtask_checkpoint() instead")]
   pub fn run_microtasks(&mut self) {
-    unsafe { v8__Isolate__RunMicrotasks(self) }
+    self.perform_microtask_checkpoint()
   }
 
   /// Enqueues the callback to the default MicrotaskQueue
@@ -577,5 +703,75 @@ impl Deref for OwnedIsolate {
 impl DerefMut for OwnedIsolate {
   fn deref_mut(&mut self) -> &mut Self::Target {
     unsafe { self.cxx_isolate.as_mut() }
+  }
+}
+
+impl HeapStatistics {
+  pub fn total_heap_size(&self) -> usize {
+    unsafe { v8__HeapStatistics__total_heap_size(self) }
+  }
+
+  pub fn total_heap_size_executable(&self) -> usize {
+    unsafe { v8__HeapStatistics__total_heap_size_executable(self) }
+  }
+
+  pub fn total_physical_size(&self) -> usize {
+    unsafe { v8__HeapStatistics__total_physical_size(self) }
+  }
+
+  pub fn total_available_size(&self) -> usize {
+    unsafe { v8__HeapStatistics__total_available_size(self) }
+  }
+
+  pub fn total_global_handles_size(&self) -> usize {
+    unsafe { v8__HeapStatistics__total_global_handles_size(self) }
+  }
+
+  pub fn used_global_handles_size(&self) -> usize {
+    unsafe { v8__HeapStatistics__used_global_handles_size(self) }
+  }
+
+  pub fn used_heap_size(&self) -> usize {
+    unsafe { v8__HeapStatistics__used_heap_size(self) }
+  }
+
+  pub fn heap_size_limit(&self) -> usize {
+    unsafe { v8__HeapStatistics__heap_size_limit(self) }
+  }
+
+  pub fn malloced_memory(&self) -> usize {
+    unsafe { v8__HeapStatistics__malloced_memory(self) }
+  }
+
+  pub fn external_memory(&self) -> usize {
+    unsafe { v8__HeapStatistics__external_memory(self) }
+  }
+
+  pub fn peak_malloced_memory(&self) -> usize {
+    unsafe { v8__HeapStatistics__peak_malloced_memory(self) }
+  }
+
+  pub fn number_of_native_contexts(&self) -> usize {
+    unsafe { v8__HeapStatistics__number_of_native_contexts(self) }
+  }
+
+  pub fn number_of_detached_contexts(&self) -> usize {
+    unsafe { v8__HeapStatistics__number_of_detached_contexts(self) }
+  }
+
+  /// Returns a 0/1 boolean, which signifies whether the V8 overwrite heap
+  /// garbage with a bit pattern.
+  pub fn does_zap_garbage(&self) -> usize {
+    unsafe { v8__HeapStatistics__does_zap_garbage(self) }
+  }
+}
+
+impl Default for HeapStatistics {
+  fn default() -> Self {
+    let mut s = MaybeUninit::<Self>::uninit();
+    unsafe {
+      v8__HeapStatistics__CONSTRUCT(&mut s);
+      s.assume_init()
+    }
   }
 }
